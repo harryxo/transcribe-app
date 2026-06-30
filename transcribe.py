@@ -90,6 +90,9 @@ RELEASE_DEBOUNCE_SECONDS = float(os.getenv("VOICE_TRANSCRIBE_RELEASE_DEBOUNCE_SE
 STREAMING_FEED_INTERVAL_SECONDS = float(
     os.getenv("VOICE_TRANSCRIBE_STREAM_FEED_INTERVAL_SECONDS", "0.5")
 )
+AUDIO_CALLBACK_STALE_SECONDS = float(
+    os.getenv("VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS", "2.0")
+)
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -147,6 +150,10 @@ class VoiceTranscribeApp(rumps.App):
         self.is_recording = False
         self.is_processing = False
         self.audio_buffer = []
+        self._audio_stream = None
+        self._audio_stream_generation = 0
+        self._audio_reopen_lock = threading.Lock()
+        self._last_audio_callback_at = 0.0
         self.history = self._load_history()
         self.settings = self._load_settings()
         self._pending_title = None
@@ -921,6 +928,25 @@ class VoiceTranscribeApp(rumps.App):
     # ── Audio Stream (always-on) ──
     # DO NOT add stream.stop(), stream.abort(), or stream.close() anywhere.
     # See module docstring for the CoreAudio HALB_Mutex deadlock explanation.
+    # If CoreAudio stops delivering callbacks after sleep/device changes, open a
+    # replacement stream generation and ignore stale callbacks from old streams.
+
+    def _audio_callback_age(self):
+        if self._last_audio_callback_at <= 0:
+            return None
+        return time.time() - self._last_audio_callback_at
+
+    def _ensure_audio_stream_fresh(self, reason):
+        age = self._audio_callback_age()
+        if age is not None and age <= AUDIO_CALLBACK_STALE_SECONDS:
+            return
+        age_label = "never" if age is None else f"{age:.1f}s ago"
+        print(
+            f"Audio stream stale before {reason} (last callback: {age_label}); "
+            "opening replacement stream.",
+            flush=True,
+        )
+        self._open_audio_stream()
 
     def _open_audio_stream(self):
         """Open a persistent audio input stream. Runs for the lifetime of the app.
@@ -928,48 +954,60 @@ class VoiceTranscribeApp(rumps.App):
         The callback always fires (~every 10ms). When is_recording is False, it
         discards the data (negligible CPU). When True, it appends to audio_buffer.
         """
-        device_idx = None
-        try:
-            for i, dev in enumerate(sd.query_devices()):
-                if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
-                    device_idx = i
-                    break
-            if device_idx is None:
+        with self._audio_reopen_lock:
+            self._audio_stream_generation += 1
+            generation = self._audio_stream_generation
+            self._last_audio_callback_at = time.time()
+
+            device_idx = None
+            try:
                 for i, dev in enumerate(sd.query_devices()):
-                    if dev['max_input_channels'] > 0:
+                    if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
                         device_idx = i
                         break
-        except Exception:
-            pass
+                if device_idx is None:
+                    for i, dev in enumerate(sd.query_devices()):
+                        if dev['max_input_channels'] > 0:
+                            device_idx = i
+                            break
+            except Exception:
+                pass
 
-        dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
-        print(f"Audio stream opened on device {device_idx}: {dev_name}", flush=True)
+            dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
+            print(
+                f"Audio stream opened on device {device_idx}: {dev_name} "
+                f"(generation {generation})",
+                flush=True,
+            )
 
-        def audio_callback(indata, frames, time_info, status):
-            if status:
-                print(f"Audio status: {status}", flush=True)
-            if self.is_recording:
-                self.audio_buffer.append(indata.copy())
-                # Feed HUD waveform — one level per callback is enough for 30fps draw.
-                try:
-                    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
-                    # Noise gate below the mic noise floor (~0.004-0.006 RMS on
-                    # MacBook mics) → bars flatten when silent rather than
-                    # jittering on ambient noise. Real speech (~0.02+ RMS) still
-                    # produces full-height bars.
-                    level = max(0.0, min(1.0, (rms - 0.006) * 12.0))
-                    self._hud.pushLevel_(level)
-                except Exception:
-                    pass
+            def audio_callback(indata, frames, time_info, status):
+                if generation != self._audio_stream_generation:
+                    return
+                self._last_audio_callback_at = time.time()
+                if status:
+                    print(f"Audio status: {status}", flush=True)
+                if self.is_recording:
+                    self.audio_buffer.append(indata.copy())
+                    # Feed HUD waveform — one level per callback is enough for 30fps draw.
+                    try:
+                        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2)))
+                        # Noise gate below the mic noise floor (~0.004-0.006 RMS on
+                        # MacBook mics) → bars flatten when silent rather than
+                        # jittering on ambient noise. Real speech (~0.02+ RMS) still
+                        # produces full-height bars.
+                        level = max(0.0, min(1.0, (rms - 0.006) * 12.0))
+                        self._hud.pushLevel_(level)
+                    except Exception:
+                        pass
 
-        self._audio_stream = sd.InputStream(
-            device=device_idx,
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            callback=audio_callback,
-        )
-        self._audio_stream.start()
+            self._audio_stream = sd.InputStream(
+                device=device_idx,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                dtype="float32",
+                callback=audio_callback,
+            )
+            self._audio_stream.start()
 
     # ── Recording ──
     # Start/stop are just flag toggles — no CoreAudio calls, no mutex, no deadlock.
@@ -977,6 +1015,7 @@ class VoiceTranscribeApp(rumps.App):
     def _start_recording(self):
         if self.is_recording or self.is_processing:
             return
+        self._ensure_audio_stream_fresh("recording-start")
         self.audio_buffer = []
         self._stream_feed_index = 0
         self._stream_failed = False
@@ -1001,6 +1040,7 @@ class VoiceTranscribeApp(rumps.App):
         if not self.is_recording:
             return
         stream_id = self._stream_id
+        recorded_for = time.time() - self._recording_start_time if self._recording_start_time else 0
         self.is_recording = False
         self._recording_start_time = None
         if stream_id:
@@ -1018,6 +1058,14 @@ class VoiceTranscribeApp(rumps.App):
         self.audio_buffer = []
 
         if not audio_data:
+            age = self._audio_callback_age()
+            age_label = "never" if age is None else f"{age:.1f}s"
+            print(
+                f"No audio captured after {recorded_for:.1f}s recording "
+                f"(last callback age={age_label}); opening replacement stream.",
+                flush=True,
+            )
+            self._open_audio_stream()
             self._cancel_streaming_session(stream_id)
             self.is_processing = False
             self._set_title(self._idle_icon_with_thermal())
