@@ -93,6 +93,9 @@ STREAMING_FEED_INTERVAL_SECONDS = float(
 AUDIO_CALLBACK_STALE_SECONDS = float(
     os.getenv("VOICE_TRANSCRIBE_AUDIO_CALLBACK_STALE_SECONDS", "2.0")
 )
+AUDIO_ZERO_PEAK_THRESHOLD = float(
+    os.getenv("VOICE_TRANSCRIBE_AUDIO_ZERO_PEAK_THRESHOLD", "0.000001")
+)
 
 # Silence gate — if the loudest 200ms window in the recording has RMS below
 # this threshold, the audio is treated as silent and no transcription runs.
@@ -154,6 +157,7 @@ class VoiceTranscribeApp(rumps.App):
         self._audio_stream_generation = 0
         self._audio_reopen_lock = threading.Lock()
         self._last_audio_callback_at = 0.0
+        self._audio_device_idx = None
         self.history = self._load_history()
         self.settings = self._load_settings()
         self._pending_title = None
@@ -936,14 +940,83 @@ class VoiceTranscribeApp(rumps.App):
             return None
         return time.time() - self._last_audio_callback_at
 
+    def _default_input_device_index(self):
+        try:
+            default_device = sd.default.device
+            if isinstance(default_device, (tuple, list)):
+                default_idx = default_device[0]
+            else:
+                default_idx = default_device
+            if default_idx is None or int(default_idx) < 0:
+                return None
+            dev = sd.query_devices(int(default_idx))
+            if dev.get("max_input_channels", 0) > 0:
+                return int(default_idx)
+        except Exception:
+            return None
+        return None
+
+    def _select_audio_device_index(self):
+        override = os.getenv("VOICE_TRANSCRIBE_INPUT_DEVICE")
+        if override:
+            try:
+                return int(override)
+            except ValueError:
+                print(f"Ignoring invalid VOICE_TRANSCRIBE_INPUT_DEVICE={override!r}", flush=True)
+
+        candidates = []
+        default_idx = self._default_input_device_index()
+        if default_idx is not None:
+            candidates.append(default_idx)
+
+        try:
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                if dev.get("max_input_channels", 0) > 0 and "MacBook" in dev.get("name", ""):
+                    candidates.append(i)
+            for i, dev in enumerate(devices):
+                name = dev.get("name", "")
+                if dev.get("max_input_channels", 0) > 0 and "BlackHole" not in name:
+                    candidates.append(i)
+        except Exception:
+            pass
+
+        seen = set()
+        for idx in candidates:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            return idx
+        return None
+
+    def _audio_device_name(self, device_idx):
+        if device_idx is None:
+            return "default"
+        try:
+            return sd.query_devices(device_idx)["name"]
+        except Exception:
+            return "unknown"
+
     def _ensure_audio_stream_fresh(self, reason):
         age = self._audio_callback_age()
-        if age is not None and age <= AUDIO_CALLBACK_STALE_SECONDS:
+        default_idx = self._default_input_device_index()
+        if (
+            age is not None
+            and age <= AUDIO_CALLBACK_STALE_SECONDS
+            and (default_idx is None or self._audio_device_idx == default_idx)
+        ):
             return
         age_label = "never" if age is None else f"{age:.1f}s ago"
+        device_note = ""
+        if default_idx is not None and self._audio_device_idx != default_idx:
+            device_note = (
+                f"; input changed from {self._audio_device_idx} "
+                f"({self._audio_device_name(self._audio_device_idx)}) to {default_idx} "
+                f"({self._audio_device_name(default_idx)})"
+            )
         print(
             f"Audio stream stale before {reason} (last callback: {age_label}); "
-            "opening replacement stream.",
+            f"opening replacement stream{device_note}.",
             flush=True,
         )
         self._open_audio_stream()
@@ -959,21 +1032,9 @@ class VoiceTranscribeApp(rumps.App):
             generation = self._audio_stream_generation
             self._last_audio_callback_at = time.time()
 
-            device_idx = None
-            try:
-                for i, dev in enumerate(sd.query_devices()):
-                    if dev['max_input_channels'] > 0 and 'MacBook' in dev['name']:
-                        device_idx = i
-                        break
-                if device_idx is None:
-                    for i, dev in enumerate(sd.query_devices()):
-                        if dev['max_input_channels'] > 0:
-                            device_idx = i
-                            break
-            except Exception:
-                pass
-
-            dev_name = sd.query_devices(device_idx)['name'] if device_idx is not None else 'default'
+            device_idx = self._select_audio_device_index()
+            self._audio_device_idx = device_idx
+            dev_name = self._audio_device_name(device_idx)
             print(
                 f"Audio stream opened on device {device_idx}: {dev_name} "
                 f"(generation {generation})",
@@ -1125,6 +1186,13 @@ class VoiceTranscribeApp(rumps.App):
             # also saves a GPU roundtrip. Short-but-loud recordings (e.g. "yes",
             # "no") pass through; short-and-quiet keypress artifacts don't.
             if max_rms < SILENCE_RMS_THRESHOLD:
+                if peak <= AUDIO_ZERO_PEAK_THRESHOLD and duration >= 0.5:
+                    print(
+                        "Zero-level audio captured; input device may be stale or muted. "
+                        "Opening replacement stream for the next recording.",
+                        flush=True,
+                    )
+                    self._open_audio_stream()
                 print(
                     f"Silent recording (max_rms={max_rms:.4f} < "
                     f"{SILENCE_RMS_THRESHOLD}), skipping transcription.",
